@@ -1,4 +1,4 @@
-"""Профессиональный корректировщик каталогов v1.5.0"""
+"""Профессиональный корректировщик каталогов v1.6.1"""
 
 import os
 from copy import copy
@@ -15,7 +15,7 @@ except ImportError:
     from openpyxl.styles import PatternFill
 
 APP_TITLE = "Профессиональный корректировщик каталогов"
-APP_VER   = "1.5.0"
+APP_VER   = "1.6.2"
 
 MATCH_COLUMNS = [
     "Категория портала ур.1", "Категория портала ур.2",
@@ -81,6 +81,40 @@ def is_yellow(cell):
 
 def is_green(cell):
     return cell_rgb(cell) == GREEN_RGB
+
+
+def unexpected_fill(cell):
+    """
+    Возвращает текстовое описание заливки ячейки, если она залита каким-то
+    цветом, ОТЛИЧНЫМ от трёх известных маркеров (красный/жёлтый/зелёный) и
+    отличным от «нет заливки». Иначе — None.
+
+    Инструмент рассчитан строго на три цвета-маркера; любая другая заливка
+    в исходном файле — вероятная опечатка при подготовке файла (не тот
+    цвет, заливка вручную и т.п.), а не то, что тулза умеет обрабатывать.
+    """
+    try:
+        f = cell.fill
+        if f.patternType != "solid":
+            return None
+        c = f.fgColor
+        if c.type == "rgb":
+            a = c.rgb
+            if not a or a == "00000000":
+                return None
+            rgb = (int(a[2:4], 16), int(a[4:6], 16), int(a[6:8], 16))
+            if rgb in (RED_RGB, YELLOW_RGB, GREEN_RGB):
+                return None
+            return f"#{a[2:]}"
+        if c.type == "indexed":
+            if c.indexed in (64, 65):  # системные "нет заливки"/"авто"
+                return None
+            return f"индексный цвет {c.indexed}"
+        if c.type == "theme":
+            return f"цвет темы {c.theme}"
+    except Exception:
+        pass
+    return None
 
 
 # ── заголовок / ключ ─────────────────────────────────────────────────────────
@@ -387,10 +421,13 @@ def is_new_row_green(src_row, src_h, match_cols, green_cols):
     """
     Строка считается добавлением ЦЕЛОЙ новой строки, если ВСЕ непустые
     ключевые ячейки (match_cols), КРОМЕ столбцов иерархии раздела
-    (CONTEXT_COLUMNS — унаследованный контекст, не обязательно
-    закрашивать отдельно), в исходной строке залиты зелёным — то есть
-    найти соответствие в каталоге в принципе не с чем.
+    (CONTEXT_COLUMNS — унаследованный контекст) и КРОМЕ «Метки»
+    (LABEL_COL — служебный ярлык/тег строки, а не содержание записи,
+    человек, готовящий правку, как правило, не красит его — тот же
+    случай, что и с CONTEXT_COLUMNS), в исходной строке залиты зелёным —
+    то есть найти соответствие в каталоге в принципе не с чем.
     """
+    exempt = CONTEXT_COLUMNS | {LABEL_COL}
     any_green_content = False
     for name in match_cols:
         col = src_h.get(name)
@@ -400,10 +437,10 @@ def is_new_row_green(src_row, src_h, match_cols, green_cols):
         if val in (None, ""):
             continue
         if col not in green_cols:
-            if name not in CONTEXT_COLUMNS:
+            if name not in exempt:
                 return False
-            continue  # непустой, но некрашеный контекстный столбец — допустимо
-        if name not in CONTEXT_COLUMNS:
+            continue  # непустой, но некрашеный контекстный/меточный столбец — допустимо
+        if name not in exempt:
             any_green_content = True
     return any_green_content
 
@@ -417,11 +454,15 @@ def write_new_row(tgt_ws, dst_row, src_row, src_h, tgt_h, change_txt, author_txt
     по имени столбца; столбцы, отсутствующие в целевом файле,
     пропускаются.
 
-    Зелёным красятся только столбцы до green_boundary включительно
-    (столбец «Тип») — видимый маркер добавления, аналогично тому, как
-    удалённая строка целиком красится красным на листе «Удалённое».
-    Столбцы правее (служебные — «Поддерживающий сервис», «Изменения по
-    запросу» и т.п.) значения получают как обычно, но не красятся.
+    Зелёным красятся только те ячейки, что были зелёными в самом
+    исходнике (повторяем заливку 1-в-1, а не красим весь диапазон целиком)
+    — например, если в источнике заливка начинается с «Тема», а столбцы
+    иерархии раздела («Категория портала ур.1-4») остались некрашеными
+    (унаследованный контекст), в целевом файле они тоже останутся без
+    заливки. Дополнительно ограничение по green_boundary (столбец «Тип»)
+    сохранено как и раньше — служебные столбцы правее («Поддерживающий
+    сервис», «Изменения по запросу» и т.п.) не красятся, даже если вдруг
+    были закрашены в источнике по ошибке.
     """
     rev_src = {v: k for k, v in src_h.items()}
 
@@ -431,7 +472,7 @@ def write_new_row(tgt_ws, dst_row, src_row, src_h, tgt_h, change_txt, author_txt
         if tgt_col is None:
             continue
         dst_cell = tgt_ws.cell(row=dst_row, column=tgt_col)
-        fill = copy(GREEN_FILL) if tgt_col <= green_boundary else NO_FILL
+        fill = copy(GREEN_FILL) if (is_green(cell) and tgt_col <= green_boundary) else NO_FILL
         restore(dst_cell, snap(cell), fill_ovr=fill)
 
     chg_col = find_col(tgt_h, *CHANGE_COL_VARIANTS)
@@ -554,6 +595,22 @@ def run_processing(src_ws, tgt_ws, del_ws, change_txt, author_txt, log):
     errors, ops, new_rows = [], [], []
 
     for src_row in src_ws.iter_rows(min_row=2):
+        n = src_row[0].row
+
+        # Инструмент рассчитан строго на три цвета-маркера (красный/жёлтый/
+        # зелёный) — любая другая заливка в исходном файле, скорее всего,
+        # ошибка подготовки файла (не тот цвет, случайная заливка и т.п.).
+        # Флагуем это как ошибку в журнале, но саму строку не пропускаем —
+        # если в ней есть и корректный маркер, он всё равно обрабатывается.
+        for cell in src_row:
+            bad = unexpected_fill(cell)
+            if bad:
+                col_name = rev.get(cell.column, f"столбец {cell.column}")
+                msg = (f"Недопустимая заливка в исходном файле: строка {n}, "
+                       f"«{col_name}» — {bad} (ожидались только красный/жёлтый/зелёный)")
+                errors.append(msg)
+                log(f"  [!] {msg}")
+
         red_src    = {c.column for c in src_row if is_red(c)}
         yellow_src = {c.column for c in src_row if is_yellow(c)}
         green_src  = {c.column for c in src_row if is_green(c)}
@@ -561,7 +618,6 @@ def run_processing(src_ws, tgt_ws, del_ws, change_txt, author_txt, log):
             continue
 
         tema = next((c.value for c in src_row if c.column == tema_col), None) if tema_col else None
-        n    = src_row[0].row
 
         if red_src:
             # Ищем строку без учёта жёлтых/зелёных столбцов — их значения в
@@ -737,6 +793,8 @@ BORDER       = "#0b1218"   # тонкая граница полей
 TEXT_PRIMARY = "#e5eaf0"   # основной текст
 TEXT_SECOND  = "#7d8b99"   # подписи секций
 ACCENT       = "#2AABEE"   # фирменный голубой Telegram
+ERROR_BG     = "#7a2020"   # заливка строк-ошибок в журнале
+ERROR_FG     = "#ffffff"   # текст строк-ошибок в журнале
 
 
 def _hex_to_rgb(h):
@@ -833,6 +891,39 @@ class GlassButton(tk.Canvas):
         self.create_text(w // 2, h // 2, text=self._text, fill=text_fill, font=self._font)
 
 
+def _enable_paste(entry):
+    """
+    Гарантирует вставку из буфера обмена по Ctrl+V и по правому клику.
+    На кириллической раскладке Windows Tk определяет комбинацию Control-v
+    по СИМВОЛУ под клавишей (а не по физической клавише) — под русской
+    раскладкой это не латинская «v», поэтому штатная привязка Entry на
+    Control-Key-v молча не срабатывает. keycode физической клавиши (86 = V)
+    не зависит от раскладки, поэтому привязка через него работает всегда.
+    """
+    def _paste(event=None):
+        try:
+            entry.event_generate("<<Paste>>")
+        except tk.TclError:
+            pass
+        return "break"
+
+    def _on_ctrl_key(event):
+        if event.keycode == 86 and (event.state & 0x4):
+            return _paste()
+
+    entry.bind("<Control-KeyPress>", _on_ctrl_key)
+
+    menu = tk.Menu(entry, tearoff=False, bg=BG_INPUT, fg=TEXT_PRIMARY,
+                    activebackground=ACCENT, activeforeground="#ffffff", bd=0)
+    menu.add_command(label="Вставить", command=_paste)
+
+    def _show_menu(event):
+        menu.tk_popup(event.x_root, event.y_root)
+        return "break"
+
+    entry.bind("<Button-3>", _show_menu)
+
+
 # ── интерфейс ─────────────────────────────────────────────────────────────────
 
 class App(tk.Tk):
@@ -882,6 +973,7 @@ class App(tk.Tk):
             bg=BG_PANEL, troughcolor=BG_APP, activebackground=ACCENT,
             highlightthickness=0, bd=0, relief="flat", width=10,
         )
+        self.log_box.tag_configure("error", background=ERROR_BG, foreground=ERROR_FG)
 
     def _sec(self, p, t):
         tk.Label(p, text=t, font=("Segoe UI", 9, "bold"),
@@ -906,11 +998,13 @@ class App(tk.Tk):
         f = tk.Frame(p, bg=BG_APP)
         f.pack(fill="x", pady=2)
         tk.Label(f, text=lbl, width=26, anchor="w", bg=BG_APP, fg=TEXT_PRIMARY).pack(side="left")
-        tk.Entry(
+        entry = tk.Entry(
             f, textvariable=var, width=48, relief="flat", bd=0,
             bg=BG_INPUT, fg=TEXT_PRIMARY, insertbackground=TEXT_PRIMARY,
             highlightthickness=1, highlightbackground=BORDER, highlightcolor=ACCENT,
-        ).pack(side="left", padx=4, ipady=3)
+        )
+        entry.pack(side="left", padx=4, ipady=3)
+        _enable_paste(entry)
 
     def _pick(self, var, title):
         p = filedialog.askopenfilename(
@@ -922,9 +1016,39 @@ class App(tk.Tk):
     def _pick_src(self): self._pick(self.src, "Выберите исходный файл")
     def _pick_tgt(self): self._pick(self.tgt, "Выберите корректируемый файл")
 
+    @staticmethod
+    def _file_is_locked(path):
+        """
+        Проверяет, занят ли файл другим приложением (например, открыт в
+        Excel). Открытие в режиме 'r+b' не изменяет содержимое, но требует
+        права на запись — Excel при открытии файла блокирует его именно от
+        записи другими процессами, поэтому попытка сразу же выявляет то,
+        что иначе привело бы к PermissionError при сохранении в конце.
+        """
+        try:
+            with open(path, "r+b"):
+                pass
+            return False
+        except PermissionError:
+            return True
+
+    @staticmethod
+    def _is_error_line(line):
+        stripped = line.strip()
+        return (
+            "[!]" in stripped
+            or "ОШИБКА]" in stripped
+            or stripped.startswith("•")
+            or stripped == "Ошибки:"
+        )
+
     def _log(self, msg):
         self.log_box.configure(state="normal")
-        self.log_box.insert("end", msg + "\n")
+        for line in msg.split("\n"):
+            start = self.log_box.index("end-1c")
+            self.log_box.insert("end", line + "\n")
+            if self._is_error_line(line):
+                self.log_box.tag_add("error", start, self.log_box.index("end-1c"))
         self.log_box.see("end")
         self.log_box.configure(state="disabled")
         self.update_idletasks()
@@ -945,6 +1069,13 @@ class App(tk.Tk):
             return
         if not os.path.isfile(tgt):
             messagebox.showerror("Ошибка", f"Файл не найден:\n{tgt}")
+            return
+        if self._file_is_locked(tgt):
+            messagebox.showerror(
+                "Файл занят",
+                f"Файл «{os.path.basename(tgt)}» уже занят — вероятно, он открыт "
+                f"в Excel или другой программе.\nЗакройте его и повторите попытку.",
+            )
             return
 
         self._clear_log()
@@ -981,7 +1112,7 @@ class App(tk.Tk):
             )
 
             if errs:
-                self._log("\nНе найдены строки:")
+                self._log("\nОшибки:")
                 for e in errs:
                     self._log(f"  • {e}")
                 messagebox.showwarning(
@@ -1001,11 +1132,12 @@ class App(tk.Tk):
                 )
 
         except PermissionError:
-            self._log("\n[ОШИБКА] Файл открыт в Excel — закройте его и повторите.")
+            name = os.path.basename(tgt)
+            self._log(f"\n[ОШИБКА] Файл «{name}» уже занят — закройте его и повторите.")
             messagebox.showerror(
-                "Ошибка доступа",
-                "Не удалось сохранить файл.\n"
-                "Закройте корректируемый файл в Excel и попробуйте снова.",
+                "Файл занят",
+                f"Файл «{name}» уже занят — не удалось сохранить изменения.\n"
+                f"Закройте его в Excel (или другой программе) и попробуйте снова.",
             )
         except Exception as exc:
             self._log(f"\n[КРИТИЧЕСКАЯ ОШИБКА] {exc}")
