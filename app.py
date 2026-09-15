@@ -1,6 +1,7 @@
-"""Профессиональный корректировщик каталогов v1.6.1"""
+"""Профессиональный корректировщик каталогов v1.7.0"""
 
 import os
+import re
 from copy import copy
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext
@@ -15,7 +16,7 @@ except ImportError:
     from openpyxl.styles import PatternFill
 
 APP_TITLE = "Профессиональный корректировщик каталогов"
-APP_VER   = "1.6.2"
+APP_VER   = "1.7.0"
 
 MATCH_COLUMNS = [
     "Категория портала ур.1", "Категория портала ур.2",
@@ -46,6 +47,92 @@ TYPE_COL      = "Тип"
 # Оба варианта написания: с одной и двумя «с» — встречаются в разных версиях файлов
 CHANGE_COL_VARIANTS = ("Изменения по запроссу", "Изменения по запросу")
 AUTHOR_COL_VARIANTS = ("Кем внесены изменения",)
+
+# ── авто-режим: сопоставление листов исходного файла с целевыми файлами ──────
+# Когда пользователь не указал конкретный "Корректируемый файл", инструмент
+# сам проходит по всем листам исходного файла и для каждого определяет
+# целевой файл по имени листа.
+
+_WORD_RE = re.compile(r"[0-9a-zA-Zа-яёА-ЯЁ]+")
+
+def _words(name):
+    """Разбивает название на слова (без учёта регистра) для сопоставления."""
+    return {w.lower() for w in _WORD_RE.findall(name)}
+
+def _norm_filename(name):
+    """Имя файла без учёта регистра и различия "е"/"ё" (частая опечатка)."""
+    return name.strip().lower().replace("ё", "е")
+
+FOLDER_PORTAL_CO   = r"P:\Направление контроля качества ИТ\Портал поддержки\Портал ЦО"
+FOLDER_PORTAL_RC   = r"P:\Направление контроля качества ИТ\Портал поддержки\Портал РЦ"
+FOLDER_PORTAL_EDI  = r"P:\Направление контроля качества ИТ\Портал поддержки\Портал EDI"
+FOLDER_KATALOGI_TS = r"P:\Направление контроля качества ИТ\Портал поддержки\Каталоги ТС"
+
+# id — ключевые слова, которые должны присутствовать в названии листа
+# (лишние слова вроде "Каталог" перед ними не мешают сопоставлению).
+SHEET_TARGET_MAP = [
+    {"id": "ЦО КЦ",               "folder": FOLDER_PORTAL_CO,   "filename": "Каталог ЦО КЦ"},
+    {"id": "ЦО ТСЧ",              "folder": FOLDER_PORTAL_CO,   "filename": "Каталог ЦО ТСЧ"},
+    {"id": "ЦО ТСХ",              "folder": FOLDER_PORTAL_CO,   "filename": "Каталог ЦО ТСХ"},
+    {"id": "ЦО ТС5",              "folder": FOLDER_PORTAL_CO,   "filename": "Каталог ЦО ТС5"},
+    {"id": "Лояльность КЦ ТСХ",   "folder": FOLDER_PORTAL_CO,   "filename": "Каталог Лояльность КЦ ТСХ"},
+    {"id": "Лояльность КЦ ТС5",   "folder": FOLDER_PORTAL_CO,   "filename": "Каталог Лояльность КЦ ТС5"},
+    {"id": "Сфера",               "folder": FOLDER_PORTAL_CO,   "filename": "Каталог Единое приложение сотрудника Сфера"},
+    {"id": "ДРБ",                 "folder": FOLDER_PORTAL_CO,   "filename": "Каталог ДРБ"},
+    {"id": "КА",                  "folder": FOLDER_PORTAL_CO,   "filename": "Каталог Внешних КА"},
+    {"id": "ESM",                 "folder": FOLDER_PORTAL_CO,   "filename": "Каталог ESM"},
+    {"id": "РЦ ТС5",              "folder": FOLDER_PORTAL_RC,   "filename": "Каталог РЦ ТС5"},
+    {"id": "РЦ ТСХ",              "folder": FOLDER_PORTAL_RC,   "filename": "Каталог РЦ ТСХ"},
+    {"id": "РЦ ТСЧ",              "folder": FOLDER_PORTAL_RC,   "filename": "Каталог РЦ ТСЧ"},
+    {"id": "EDI",                 "folder": FOLDER_PORTAL_EDI,  "filename": "Каталог портала EDI"},
+    {"id": "Каталог Чижик",       "folder": FOLDER_KATALOGI_TS, "filename": "Каталог Чижик"},
+    {"id": "Каталог Перекресток", "folder": FOLDER_KATALOGI_TS, "filename": "Каталог Перекресток"},
+    {"id": "Каталог Пятерочка",   "folder": FOLDER_KATALOGI_TS, "filename": "Каталог Пятёрочка"},
+    {"id": "Около",               "folder": FOLDER_KATALOGI_TS, "filename": "Каталог Около"},
+]
+for _entry in SHEET_TARGET_MAP:
+    _entry["words"] = _words(_entry["id"])
+
+
+def match_sheet_target(sheet_name):
+    """
+    Определяет целевой файл по названию листа: совпадение засчитывается,
+    если ВСЕ ключевые слова эталона входят в набор слов названия листа
+    (лишние слова не мешают, порядок и регистр не важны). Если не найдено
+    ни одного совпадения либо найдено несколько — возвращает None
+    (неоднозначность не разрешается автоматически, как и везде в этом
+    инструменте — лист будет пропущен с записью в журнал).
+    """
+    sheet_words = _words(sheet_name)
+    matches = [e for e in SHEET_TARGET_MAP if e["words"] <= sheet_words]
+    return matches[0] if len(matches) == 1 else None
+
+
+def resolve_target_path(entry):
+    """
+    Ищет в папке entry['folder'] файл с именем entry['filename']
+    (без учёта регистра, "ё"/"е" и конкретного расширения). Возвращает
+    (путь, None) при успехе либо (None, текст ошибки).
+    """
+    folder = entry["folder"]
+    wanted = _norm_filename(entry["filename"])
+    try:
+        names = os.listdir(folder)
+    except OSError as exc:
+        return None, f"Не удалось открыть папку «{folder}»: {exc}"
+
+    candidates = [
+        n for n in names
+        if os.path.splitext(n)[1].lower() in (".xlsx", ".xlsm", ".xls")
+        and _norm_filename(os.path.splitext(n)[0]) == wanted
+    ]
+    if not candidates:
+        return None, f"Файл «{entry['filename']}» не найден в папке «{folder}»"
+    if len(candidates) > 1:
+        return None, (f"В папке «{folder}» найдено несколько подходящих файлов "
+                       f"«{entry['filename']}»: {', '.join(candidates)}")
+    return os.path.join(folder, candidates[0]), None
+
 
 RED_RGB    = (255, 0, 0)
 YELLOW_RGB = (255, 255, 0)
@@ -950,7 +1037,7 @@ class App(tk.Tk):
 
         self._sec(main, "Файлы")
         self._file_row(main, "Исходный файл:",        self.src,  self._pick_src)
-        self._file_row(main, "Корректируемый файл:", self.tgt,  self._pick_tgt)
+        self._file_row(main, "Корректируемый файл (необязательно):", self.tgt,  self._pick_tgt)
 
         self._sec(main, "Информация об изменениях")
         self._entry_row(main, "Изменения по запросу:",   self.chg)
@@ -1058,90 +1145,196 @@ class App(tk.Tk):
         self.log_box.delete("1.0", "end")
         self.log_box.configure(state="disabled")
 
+    def _process_one(self, src_ws, tgt_path, chg, author):
+        """
+        Обрабатывает один исходный лист против одного целевого файла:
+        открывает, запускает run_processing, сохраняет. Только пишет в
+        журнал, НЕ показывает messagebox — это решает вызывающий код:
+        в ручном режиме (один файл) попап уместен, в авто-режиме
+        (до 18 файлов за прогон) попап на каждый файл был бы неюзабелен,
+        там достаточно записи в журнале и итоговой сводки в конце.
+
+        Возвращает dict: {"ok": True, "full", "part", "corr", "green",
+        "new", "errors"} при успехе, либо {"ok": False, "title", "message"}
+        при ошибке (уже залогированной).
+        """
+        name = os.path.basename(tgt_path)
+
+        if not os.path.isfile(tgt_path):
+            msg = f"Файл не найден:\n{tgt_path}"
+            self._log(f"  [!] Файл не найден: {tgt_path}")
+            return {"ok": False, "title": "Ошибка", "message": msg}
+
+        if self._file_is_locked(tgt_path):
+            msg = (f"Файл «{name}» уже занят — вероятно, он открыт в Excel "
+                   f"или другой программе.\nЗакройте его и повторите попытку.")
+            self._log(f"  [!] Файл «{name}» занят — пропущен")
+            return {"ok": False, "title": "Файл занят", "message": msg}
+
+        try:
+            tgt_wb = load_workbook(tgt_path)
+
+            if DELETED_SHEET not in tgt_wb.sheetnames:
+                msg = f"Лист «{DELETED_SHEET}» не найден в файле «{name}»."
+                self._log(f"  [!] {msg}")
+                return {"ok": False, "title": "Ошибка", "message": msg}
+
+            full, part, corr, green, new, errs = run_processing(
+                src_ws, tgt_wb.worksheets[0], tgt_wb[DELETED_SHEET],
+                chg, author, self._log,
+            )
+            tgt_wb.save(tgt_path)
+
+            self._log(
+                f"  Готово: {name} — удалено {full} | частично {part} | "
+                f"скорректировано {corr} | добавлено ячеек {green} | "
+                f"новых строк {new} | ошибок {len(errs)}"
+            )
+            if errs:
+                self._log("  Ошибки:")
+                for e in errs:
+                    self._log(f"    • {e}")
+
+            return {"ok": True, "full": full, "part": part, "corr": corr,
+                     "green": green, "new": new, "errors": errs}
+
+        except PermissionError:
+            msg = (f"Файл «{name}» уже занят — не удалось сохранить изменения.\n"
+                   f"Закройте его в Excel (или другой программе) и попробуйте снова.")
+            self._log(f"  [ОШИБКА] Файл «{name}» занят — не удалось сохранить")
+            return {"ok": False, "title": "Файл занят", "message": msg}
+        except Exception as exc:
+            self._log(f"  [КРИТИЧЕСКАЯ ОШИБКА] {name}: {exc}")
+            return {"ok": False, "title": "Критическая ошибка", "message": str(exc)}
+
+    def _run_manual(self, src_wb, tgt, chg, author):
+        """Ручной режим: путь к целевому файлу указан явно — обрабатывается
+        только первый лист исходного файла, как и раньше."""
+        self._log(f"Корректируемый: {os.path.basename(tgt)}")
+        self._log("=" * 58)
+
+        result = self._process_one(src_wb.worksheets[0], tgt, chg, author)
+        self._log("-" * 58)
+
+        if not result["ok"]:
+            messagebox.showerror(result["title"], result["message"])
+            return
+
+        if result["errors"]:
+            messagebox.showwarning(
+                "Завершено с предупреждениями",
+                f"Удалено строк: {result['full']}\nЧастичных удалений: {result['part']}\n"
+                f"Корректировок: {result['corr']}\nДобавлено ячеек: {result['green']}\n"
+                f"Новых строк: {result['new']}\nНе найдено: {len(result['errors'])}\n\n"
+                f"Подробности — в журнале.",
+            )
+        else:
+            messagebox.showinfo(
+                "Готово",
+                f"Обработка завершена.\n"
+                f"Удалено строк: {result['full']}\nЧастичных удалений: {result['part']}\n"
+                f"Корректировок: {result['corr']}\nДобавлено ячеек: {result['green']}\n"
+                f"Новых строк: {result['new']}",
+            )
+
+    def _run_auto(self, src_wb, chg, author):
+        """
+        Авто-режим: целевой файл не указан — определяется по названию
+        каждого листа исходного файла (см. SHEET_TARGET_MAP). Нераспознанные
+        листы и любые ошибки по конкретному листу не останавливают
+        обработку остальных — только фиксируются в журнале.
+        """
+        self._log("Режим: автоматический подбор целевых файлов по названиям листов")
+        self._log("=" * 58)
+
+        totals = {"full": 0, "part": 0, "corr": 0, "green": 0, "new": 0, "errors": 0}
+        processed = 0
+
+        for ws in src_wb.worksheets:
+            entry = match_sheet_target(ws.title)
+            if entry is None:
+                self._log(f"  [!] Лист «{ws.title}» не распознан — пропущен")
+                continue
+
+            path, err = resolve_target_path(entry)
+            if err:
+                self._log(f"  [!] Лист «{ws.title}» ({entry['id']}): {err}")
+                continue
+
+            self._log(f"— Лист «{ws.title}» → {os.path.basename(path)}")
+            result = self._process_one(ws, path, chg, author)
+            processed += 1
+
+            if not result["ok"]:
+                continue
+
+            totals["full"]   += result["full"]
+            totals["part"]   += result["part"]
+            totals["corr"]   += result["corr"]
+            totals["green"]  += result["green"]
+            totals["new"]    += result["new"]
+            totals["errors"] += len(result["errors"])
+
+        self._log("-" * 58)
+        self._log(
+            f"Обработано листов: {processed}. Удалено строк: {totals['full']}  |  "
+            f"Частичных удалений: {totals['part']}  |  Корректировок: {totals['corr']}  |  "
+            f"Добавлено ячеек: {totals['green']}  |  Новых строк: {totals['new']}  |  "
+            f"Ошибок: {totals['errors']}"
+        )
+
+        if processed == 0:
+            messagebox.showwarning(
+                "Ничего не обработано",
+                "Ни один лист исходного файла не удалось сопоставить с целевым "
+                "файлом.\nПодробности — в журнале.",
+            )
+        elif totals["errors"]:
+            messagebox.showwarning(
+                "Завершено с предупреждениями",
+                f"Обработано листов: {processed}\n"
+                f"Удалено строк: {totals['full']}\nЧастичных удалений: {totals['part']}\n"
+                f"Корректировок: {totals['corr']}\nДобавлено ячеек: {totals['green']}\n"
+                f"Новых строк: {totals['new']}\nОшибок: {totals['errors']}\n\n"
+                f"Подробности — в журнале.",
+            )
+        else:
+            messagebox.showinfo(
+                "Готово",
+                f"Обработано листов: {processed}\n"
+                f"Удалено строк: {totals['full']}\nЧастичных удалений: {totals['part']}\n"
+                f"Корректировок: {totals['corr']}\nДобавлено ячеек: {totals['green']}\n"
+                f"Новых строк: {totals['new']}",
+            )
+
     def _run(self):
         src = self.src.get().strip()
         tgt = self.tgt.get().strip()
-        if not src or not tgt:
-            messagebox.showerror("Ошибка", "Укажите оба файла перед запуском.")
+        chg = self.chg.get().strip()
+        author = self.auth.get().strip()
+
+        if not src:
+            messagebox.showerror("Ошибка", "Укажите исходный файл перед запуском.")
             return
         if not os.path.isfile(src):
             messagebox.showerror("Ошибка", f"Файл не найден:\n{src}")
             return
-        if not os.path.isfile(tgt):
-            messagebox.showerror("Ошибка", f"Файл не найден:\n{tgt}")
-            return
-        if self._file_is_locked(tgt):
-            messagebox.showerror(
-                "Файл занят",
-                f"Файл «{os.path.basename(tgt)}» уже занят — вероятно, он открыт "
-                f"в Excel или другой программе.\nЗакройте его и повторите попытку.",
-            )
-            return
 
         self._clear_log()
         self._log("=" * 58)
-        self._log(f"Исходный:       {os.path.basename(src)}")
-        self._log(f"Корректируемый: {os.path.basename(tgt)}")
-        self._log("=" * 58)
+        self._log(f"Исходный: {os.path.basename(src)}")
 
         try:
             src_wb = load_workbook(src)
-            tgt_wb = load_workbook(tgt)
-
-            if DELETED_SHEET not in tgt_wb.sheetnames:
-                messagebox.showerror("Ошибка",
-                    f"Лист «{DELETED_SHEET}» не найден в корректируемом файле.")
-                return
-
-            full, part, corr, green, new, errs = run_processing(
-                src_wb.worksheets[0],
-                tgt_wb.worksheets[0],
-                tgt_wb[DELETED_SHEET],
-                self.chg.get().strip(),
-                self.auth.get().strip(),
-                self._log,
-            )
-
-            tgt_wb.save(tgt)
-            self._log("-" * 58)
-            self._log(
-                f"Готово. Удалено строк: {full}  |  "
-                f"Частичных удалений: {part}  |  Корректировок: {corr}  |  "
-                f"Добавлено ячеек: {green}  |  Новых строк: {new}  |  "
-                f"Ошибок: {len(errs)}"
-            )
-
-            if errs:
-                self._log("\nОшибки:")
-                for e in errs:
-                    self._log(f"  • {e}")
-                messagebox.showwarning(
-                    "Завершено с предупреждениями",
-                    f"Удалено строк: {full}\nЧастичных удалений: {part}\n"
-                    f"Корректировок: {corr}\nДобавлено ячеек: {green}\n"
-                    f"Новых строк: {new}\nНе найдено: {len(errs)}\n\n"
-                    f"Подробности — в журнале.",
-                )
-            else:
-                messagebox.showinfo(
-                    "Готово",
-                    f"Обработка завершена.\n"
-                    f"Удалено строк: {full}\nЧастичных удалений: {part}\n"
-                    f"Корректировок: {corr}\nДобавлено ячеек: {green}\n"
-                    f"Новых строк: {new}",
-                )
-
-        except PermissionError:
-            name = os.path.basename(tgt)
-            self._log(f"\n[ОШИБКА] Файл «{name}» уже занят — закройте его и повторите.")
-            messagebox.showerror(
-                "Файл занят",
-                f"Файл «{name}» уже занят — не удалось сохранить изменения.\n"
-                f"Закройте его в Excel (или другой программе) и попробуйте снова.",
-            )
         except Exception as exc:
-            self._log(f"\n[КРИТИЧЕСКАЯ ОШИБКА] {exc}")
+            self._log(f"[КРИТИЧЕСКАЯ ОШИБКА] Не удалось открыть исходный файл: {exc}")
             messagebox.showerror("Критическая ошибка", str(exc))
+            return
+
+        if tgt:
+            self._run_manual(src_wb, tgt, chg, author)
+        else:
+            self._run_auto(src_wb, chg, author)
 
 
 if __name__ == "__main__":
